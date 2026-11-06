@@ -573,6 +573,11 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     blanks.sort((a, b) => b[2] - a[2]);
     return { cells, rowTotal, colTotal, noTech, noEff, max, min: min === Infinity ? 0 : min, sum, hot, blanks, n: patents.length };
   }
+  function estTokens(s) {
+    const t = String(s || "");
+    const cjk = (t.match(/[\u3000-\u9fff\uf900-\ufaff\uac00-\ud7af\uff00-\uffef]/g) || []).length;
+    return Math.ceil(cjk + (t.length - cjk) / 3.5);
+  }
   class AIError extends Error {
     constructor(msg, kind, wait) {
       super(msg);
@@ -592,9 +597,30 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       this.dyn = Math.max(2, Math.floor(cur * 0.6));
     },
     lastSlow: 0,
+    tokenStamps: [],
+    /* Groq 免費方案的主要限制是每分鐘 token，送出前先排隊，避免撞牆 */
+    async takeTokens(n, tpm) {
+      for (; ; ) {
+        if (Job.running && Job.stop) throw new AIError("\u5DF2\u505C\u6B62", "cancel");
+        const now = Date.now();
+        if (now < this.pauseUntil) {
+          await sleep(Math.min(this.pauseUntil - now, 1e3));
+          continue;
+        }
+        this.tokenStamps = this.tokenStamps.filter((x) => now - x.t < 6e4);
+        const used = this.tokenStamps.reduce((a, x) => a + x.n, 0);
+        if (!this.tokenStamps.length || used + n <= tpm) {
+          const st = { t: now, n };
+          this.tokenStamps.push(st);
+          return st;
+        }
+        await sleep(Math.min(1e3, Math.max(6e4 - (now - this.tokenStamps[0].t), 100)));
+      }
+    },
     async take(rpmSetting) {
       const rpm = Math.min(rpmSetting, this.dyn || rpmSetting);
       for (; ; ) {
+        if (Job.running && Job.stop) throw new AIError("\u5DF2\u505C\u6B62", "cancel");
         const now = Date.now();
         if (now < this.pauseUntil) {
           await sleep(Math.min(this.pauseUntil - now, 1e3));
@@ -605,7 +631,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
           this.stamps.push(now);
           return;
         }
-        await sleep(Math.max(6e4 - (now - this.stamps[0]), 50));
+        await sleep(Math.min(1e3, Math.max(6e4 - (now - this.stamps[0]), 50)));
       }
     }
   };
@@ -618,13 +644,36 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       return (S.keys[p] || "").trim();
     },
     model() {
-      return S.settings.provider === "gemini" ? S.settings.geminiModel : S.settings.claudeModel;
+      const s = S.settings;
+      return s.provider === "gemini" ? s.geminiModel : s.provider === "groq" ? s.groqModel : s.claudeModel;
     },
+    label(p = AI.provider()) {
+      return { gemini: "Gemini", claude: "Claude", groq: "Groq" }[p];
+    },
+    rpm() {
+      return AI.provider() === "groq" ? S.settings.groqRpm : S.settings.rpm;
+    },
+    groqOutputCap() {
+      return Math.max(800, Math.floor(S.settings.groqTpm * 0.3));
+    },
+    /* 單次請求可送的輸入 token 上限；Gemini 與 Claude 不限 */
+    inputLimit() {
+      return AI.provider() === "groq" ? Math.max(1e3, S.settings.groqTpm - AI.groqOutputCap() - 200) : Infinity;
+    },
+    liteMode() {
+      return AI.provider() === "groq" && S.settings.contextMode === "lite";
+    },
+    groqOk: false,
     async _fetch(url, init) {
       let r;
       try {
         r = await fetch(url, init);
       } catch (e) {
+        if (AI.provider() === "groq" && url.includes("groq.com") && !AI.groqOk) {
+          const err = new AIError("\u9023\u4E0D\u4E0A Groq\uFF1A\u53EF\u80FD\u662F Groq \u4E0D\u63A5\u53D7\u7DB2\u9801\u76F4\u63A5\u9023\u7DDA\uFF0C\u6216\u88AB\u7DB2\u8DEF\u3001\u9632\u706B\u7246\u64CB\u4E0B\u3002\u8ACB\u5148\u6539\u7528 Gemini \u6216 Claude\uFF0C\u4E26\u544A\u77E5\u958B\u767C\u8005\u9700\u8981\u52A0\u4E2D\u7E7C\u7AD9\u3002", "net");
+          err.noRetry = true;
+          throw err;
+        }
         throw new AIError("\u7121\u6CD5\u9023\u7DDA\u5230 AI \u670D\u52D9\uFF0C\u8ACB\u6AA2\u67E5\u7DB2\u8DEF\u6216\u516C\u53F8\u9632\u706B\u7246\u3002", "net");
       }
       if (r.ok) return r.json();
@@ -636,6 +685,8 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       } catch (e) {
       }
       msg = clip(msg, 240);
+      if (r.status === 413 || /request too large|context_length_exceeded|reduce the length|reduce your message/i.test(body)) throw new AIError(`\u9019\u4EF6\u5167\u5BB9\u8D85\u904E\u6A21\u578B\u6BCF\u6B21\u53EF\u8655\u7406\u7684\u4E0A\u9650\u3002\u5982\u679C\u4F7F\u7528 Groq\uFF0C\u53EF\u5230 AI \u8A2D\u5B9A\u6539\u7528\u300C\u7CBE\u7C21\u5167\u5BB9\u300D\u6216\u63DB\u8F03\u5927\u7684\u6A21\u578B\uFF1A${msg}`, "toolarge");
+      if (r.status === 400 && /json_validate_failed/.test(body)) throw new AIError("AI \u56DE\u61C9\u4E0D\u662F\u6709\u6548\u7684 JSON", "content");
       if (r.status === 401 || r.status === 403) throw new AIError(`\u91D1\u9470\u88AB\u62D2\u7D55\uFF08${r.status}\uFF09\uFF1A${msg}`, "auth");
       if (r.status === 404) throw new AIError(`\u627E\u4E0D\u5230\u6A21\u578B\uFF08404\uFF09\uFF0C\u8ACB\u5230\u8A2D\u5B9A\u6539\u7528\u53EF\u7528\u7684\u6A21\u578B\uFF1A${msg}`, "auth");
       if (r.status === 400 && /api key|api_key|credential/i.test(msg)) throw new AIError(`\u91D1\u9470\u7121\u6548\uFF1A${msg}`, "auth");
@@ -676,6 +727,37 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
         if (cand.finishReason === "MAX_TOKENS") throw new AIError("AI \u56DE\u61C9\u8D85\u904E\u9577\u5EA6\u4E0A\u9650", "content");
         return text2;
       }
+      if (provider === "groq") {
+        if (images && images.length) throw new AIError("Groq \u6A21\u5F0F\u4E0D\u652F\u63F4\u6383\u63CF\u6A94\u8FA8\u8B58\uFF0C\u8ACB\u5230 AI \u8A2D\u5B9A\u6539\u7528 Gemini \u6216 Claude\u3002", "bad");
+        const cap = Math.min(maxTokens, AI.groqOutputCap());
+        const messages = [];
+        if (system) messages.push({ role: "system", content: system });
+        messages.push({ role: "user", content: user });
+        const stamp = await Limiter.takeTokens(estTokens(system) + estTokens(user) + cap, S.settings.groqTpm);
+        const body2 = { model: S.settings.groqModel, messages, temperature: 0.1, max_completion_tokens: cap };
+        if (json) body2.response_format = { type: "json_object" };
+        let j2;
+        try {
+          j2 = await AI._fetch("https://api.groq.com/openai/v1/chat/completions", {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: `Bearer ${AI.key()}` },
+            body: JSON.stringify(body2)
+          });
+        } catch (e) {
+          stamp.n = 0;
+          throw e;
+        }
+        AI.groqOk = true;
+        if (j2.usage?.total_tokens) stamp.n = j2.usage.total_tokens;
+        const ch = j2.choices?.[0];
+        const text2 = ch?.message?.content || "";
+        AI.usage.input += j2.usage?.prompt_tokens || 0;
+        AI.usage.output += j2.usage?.completion_tokens || 0;
+        AI.usage.calls++;
+        if (ch?.finish_reason === "length") throw new AIError("AI \u56DE\u61C9\u8D85\u904E\u9577\u5EA6\u4E0A\u9650", "content");
+        if (!text2) throw new AIError("AI \u6C92\u6709\u56DE\u50B3\u5167\u5BB9", "content");
+        return text2;
+      }
       const content = [];
       (images || []).forEach((b64) => content.push({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: b64 } }));
       content.push({ type: "text", text: user });
@@ -698,18 +780,18 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     async call(opts) {
       const tries = 8;
       for (let n = 0; ; n++) {
-        await Limiter.take(S.settings.rpm);
+        await Limiter.take(AI.rpm());
         try {
           const out = await AI.callOnce(opts);
           if (Limiter.dyn) {
             Limiter.dyn += 1;
-            if (Limiter.dyn >= S.settings.rpm) Limiter.dyn = 0;
+            if (Limiter.dyn >= AI.rpm()) Limiter.dyn = 0;
           }
           return out;
         } catch (e) {
-          if (e.kind === "auth" || e.kind === "bad" || e.kind === "quota" || n >= tries - 1) throw e;
+          if (e.kind === "cancel" || e.kind === "auth" || e.kind === "bad" || e.kind === "quota" || e.kind === "toolarge" || e.noRetry || n >= tries - 1) throw e;
           if (e.status && e.status !== 429 && n >= 5) throw e;
-          if (e.status === 429) Limiter.slow(S.settings.rpm);
+          if (e.status === 429) Limiter.slow(AI.rpm());
           if (e.kind === "content" && n >= 1) throw e;
           const wait = Math.min(e.status === 429 ? 12e4 : 3e4, Math.max(e.wait || 0, 2e3 * 2 ** n)) + Math.random() * 800;
           if (e.kind === "retry") Limiter.pauseUntil = Math.max(Limiter.pauseUntil, Date.now() + wait);
@@ -735,6 +817,11 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       if (provider === "gemini") {
         const j2 = await AI._fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", { headers: { "x-goog-api-key": AI.key() } });
         return (j2.models || []).filter((m) => (m.supportedGenerationMethods || []).includes("generateContent")).map((m) => m.name.replace(/^models\//, ""));
+      }
+      if (provider === "groq") {
+        const j2 = await AI._fetch("https://api.groq.com/openai/v1/models", { headers: { authorization: `Bearer ${AI.key()}` } });
+        AI.groqOk = true;
+        return (j2.data || []).map((m) => m.id).filter((id) => !/whisper|tts|guard|prompt-guard|orpheus/i.test(id)).sort();
       }
       const j = await AI._fetch("https://api.anthropic.com/v1/models?limit=100", {
         headers: { "x-api-key": AI.key(), "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" }
@@ -1386,12 +1473,11 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
     const parts = [];
     parts.push(`\u516C\u958B\u865F\uFF1A${p.pubNo || "\uFF08\u672A\u77E5\uFF09"}
 \u540D\u7A31\uFF1A${p.title || "\uFF08\u672A\u77E5\uFF09"}`);
-    if (p.abstract) parts.push(`[A1 \u6458\u8981]
-${clip(p.abstract, 2200)}`);
-    if (p.claims) parts.push(`[C1 \u8ACB\u6C42\u9805]
-${clip(p.claims, 3500)}`);
-    const chunks = await DB.chunksOf(p.id);
+    const lite = AI.liteMode();
+    let abs = clip(p.abstract, lite ? 1500 : 2200), cl = clip(p.claims, lite ? 1500 : 3500);
+    const chunks = lite ? [] : await DB.chunksOf(p.id);
     const desc = chunks.filter((c) => c.sec === "\u8AAA\u660E\u66F8");
+    const descParts = [];
     if (desc.length) {
       const queries = wantClass ? [...tx.tech, ...tx.eff].map((t) => `${t.name} ${t.def || ""} ${t.kw || ""}`) : ["\u6280\u8853\u554F\u984C \u89E3\u6C7A\u624B\u6BB5 \u529F\u6548 problem solution effect advantage"];
       const bm = new BM25(desc.map((c) => ({ id: c.i, text: c.text })));
@@ -1405,12 +1491,31 @@ ${clip(p.claims, 3500)}`);
         const c = desc.find((d) => d.i === i);
         if (!c || budget <= 0) break;
         const t = c.text.slice(0, budget);
-        parts.push(`[D${n++} \u8AAA\u660E\u66F8\u6BB5\u843D]
+        descParts.push(`[D${n++} \u8AAA\u660E\u66F8\u6BB5\u843D]
 ${t}`);
         budget -= t.length;
       }
     }
-    const text = parts.join("\n\n");
+    const limit = AI.inputLimit();
+    const overhead = isFinite(limit) ? 500 + (wantClass ? estTokens([...tx.tech, ...tx.eff].map((t) => t.id + t.name + t.def).join()) : 0) : 0;
+    const assemble = () => [parts[0], abs && `[A1 \u6458\u8981]
+${abs}`, cl && `[C1 \u8ACB\u6C42\u9805]
+${cl}`, ...descParts].filter(Boolean).join("\n\n");
+    let text = assemble();
+    if (isFinite(limit)) {
+      while (estTokens(text) + overhead > limit && descParts.length) {
+        descParts.pop();
+        text = assemble();
+      }
+      while (estTokens(text) + overhead > limit && cl.length > 300) {
+        cl = cl.slice(0, Math.floor(cl.length * 0.7));
+        text = assemble();
+      }
+      while (estTokens(text) + overhead > limit && abs.length > 300) {
+        abs = abs.slice(0, Math.floor(abs.length * 0.7));
+        text = assemble();
+      }
+    }
     return { text, norm: normQ(text) };
   }
   function sanitizeSummary(s, p) {
@@ -1492,6 +1597,13 @@ ${t}`);
             await worker(it);
             streak = 0;
           } catch (e) {
+            if (e.kind === "cancel") continue;
+            if (e.noRetry) {
+              Job.fatal = e.message;
+              Job.stop = true;
+              updateDock();
+              continue;
+            }
             if (e.kind === "quota") {
               Job.fatal = e.message;
               Job.quota = true;
@@ -1546,7 +1658,8 @@ ${t}`);
   function estimateTokens(items) {
     const defLen = [...S.tx.tech, ...S.tx.eff].reduce((a, t) => a + t.name.length + (t.def || "").length + 8, 0);
     let chars = 0;
-    for (const p of items) chars += Math.min(p.abstract.length, 2200) + Math.min(p.claims.length, 3500) + Math.min(p.textLen || 0, 5500) + defLen + 800;
+    const lite = AI.liteMode();
+    for (const p of items) chars += lite ? Math.min(p.abstract.length, 1500) + Math.min(p.claims.length, 1500) + defLen + 800 : Math.min(p.abstract.length, 2200) + Math.min(p.claims.length, 3500) + Math.min(p.textLen || 0, 5500) + defLen + 800;
     return { input: Math.round(chars / 2.6), output: items.length * 450 };
   }
   async function startAnalysis(mode) {
@@ -1568,6 +1681,11 @@ ${t}`);
     const items = S.patents.filter((p) => p.status === "scanned");
     if (!items.length) {
       toast("\u6C92\u6709\u5F85\u8FA8\u8B58\u7684\u6383\u63CF\u6A94\u3002");
+      return;
+    }
+    if (AI.provider() === "groq") {
+      toast("Groq \u6A21\u5F0F\u4E0D\u652F\u63F4\u6383\u63CF\u6A94\u8FA8\u8B58\uFF0C\u8ACB\u5230\u300CAI \u8A2D\u5B9A\u300D\u6539\u7528 Gemini \u6216 Claude\u3002", true);
+      go("settings");
       return;
     }
     if (!AI.key()) {
@@ -1626,9 +1744,11 @@ ${p.claims.slice(0, 800)}`, 4e3)));
     return out;
   }
   async function proposeTaxonomy(hint) {
-    const sample = sampleForTaxonomy();
+    const small = isFinite(AI.inputLimit());
+    const sample = sampleForTaxonomy(small ? 20 : 40);
+    const each = small ? Math.max(60, Math.floor((AI.inputLimit() - 600) / 20) - 30) : 400;
     if (!sample.length) throw new Error("\u8ACB\u5148\u532F\u5165\u5C08\u5229\u8CC7\u6599\u3002");
-    const text = sample.map((p, i) => `(${i + 1}) ${clip(p.title, 80)}\uFF1A${clip(p.abstract || p.claims, 400)}`).join("\n");
+    const text = sample.map((p, i) => `(${i + 1}) ${clip(p.title, 80)}\uFF1A${clip(p.abstract || p.claims, each)}`).join("\n");
     const user = `\u4EE5\u4E0B\u662F\u4E00\u6279\u5C08\u5229\u7684\u62BD\u6A23\uFF08${sample.length} \u4EF6\uFF0C\u5168\u90E8 ${S.patents.filter(usable).length} \u4EF6\uFF09\u3002
 \u8ACB\u63D0\u51FA\u6280\u8853\u529F\u6548\u5206\u6790\u7528\u7684\u5206\u985E\uFF1A\u6280\u8853 5 \u5230 8 \u9805\u3001\u529F\u6548 4 \u5230 6 \u9805\u3002\u9805\u76EE\u5F7C\u6B64\u76E1\u91CF\u4E92\u65A5\uFF0C\u6DB5\u84CB\u5927\u591A\u6578\u5C08\u5229\uFF0C\u540D\u7A31\u4F7F\u7528\u7522\u696D\u6163\u7528\u8A9E\u3002
 ${hint ? `\u4F7F\u7528\u8005\u7684\u5206\u6790\u91CD\u9EDE\uFF1A${hint}
@@ -1641,7 +1761,7 @@ ${text}`;
     const user = `\u4EE5\u4E0B\u662F\u4F7F\u7528\u8005\u63D0\u4F9B\u7684\u5C08\u5229\u5206\u985E\u5B9A\u7FA9\u6587\u4EF6\u3002\u8ACB\u5FE0\u5BE6\u64F7\u53D6\u5176\u4E2D\u7684\u300C\u6280\u8853\u300D\u8207\u300C\u529F\u6548\u300D\u5206\u985E\u9805\u76EE\u53CA\u5B9A\u7FA9\uFF0C\u4E0D\u8981\u81EA\u884C\u65B0\u589E\u9805\u76EE\uFF1B\u82E5\u6587\u4EF6\u6C92\u6709\u95DC\u9375\u5B57\uFF0C\u518D\u4F9D\u5B9A\u7FA9\u88DC\u4E0A\u7E41\u4E2D\u3001\u7B80\u4E2D\u3001\u82F1\u6587\u95DC\u9375\u5B57\u3002
 \u53EA\u8F38\u51FA JSON\uFF0C\u683C\u5F0F\uFF1A${TX_SHAPE}
 
-${clip(text, 3e4)}`;
+${clip(text, isFinite(AI.inputLimit()) ? AI.inputLimit() - 500 : 3e4)}`;
     return adoptTaxonomy(await AI.callJSON({ system: SYS_ANALYST, user, maxTokens: 6e3 }));
   }
   function taxonomyFromSheet(wb) {
@@ -1688,6 +1808,9 @@ ${clip(text, 3e4)}`;
     const byId = new Map(S.patents.map((p) => [p.id, p]));
     const srcs = passages.map((c, i) => ({ tag: `S${i + 1}`, pid: c.pid, no: byId.get(c.pid)?.pubNo || byId.get(c.pid)?.title || "\u672A\u77E5", sec: c.sec, text: c.text }));
     if (!srcs.length) return { answer: "\u8CC7\u6599\u4E2D\u627E\u4E0D\u5230\u76F8\u95DC\u5167\u5BB9\u3002\u53EF\u4EE5\u63DB\u500B\u95DC\u9375\u5B57\uFF0C\u6216\u78BA\u8A8D\u5C08\u5229\u5DF2\u532F\u5165\u6210\u529F\u3002", srcs: [] };
+    const room = AI.inputLimit() - 700 - estTokens(statsBlock()) - estTokens(q);
+    while (isFinite(room) && srcs.length > 1 && estTokens(srcs.map((s) => s.text).join("")) + srcs.length * 15 > room) srcs.pop();
+    if (isFinite(room) && estTokens(srcs[0].text) > room) srcs[0].text = srcs[0].text.slice(0, Math.max(200, room));
     const ctx = srcs.map((s) => `[${s.tag}] ${s.no}\uFF08${s.sec}\uFF09
 ${s.text}`).join("\n\n");
     const answer = await AI.call({
@@ -2024,8 +2147,8 @@ ${q}`,
     tx: { tech: [], eff: [] },
     index: null,
     vectors: /* @__PURE__ */ new Map(),
-    keys: { gemini: "", claude: "" },
-    settings: { provider: "gemini", geminiModel: "gemini-3.6-flash", claudeModel: "claude-haiku-5-5", embedModel: "gemini-embedding-001", concurrency: 4, rpm: 60, keepFigures: true, rememberKeys: false },
+    keys: { gemini: "", claude: "", groq: "" },
+    settings: { provider: "gemini", geminiModel: "gemini-3.6-flash", claudeModel: "claude-haiku-5-5", groqModel: "llama-3.1-8b-instant", groqTpm: 6e3, groqRpm: 30, contextMode: "full", embedModel: "gemini-embedding-001", concurrency: 4, rpm: 60, keepFigures: true, rememberKeys: false },
     ui: { importPage: 0, importQ: "", importFilter: "all", detailPage: 0, detailReview: false, detailQ: "", matrixTab: "matrix", sort: "def", fCountry: "", fApplicant: "", fFrom: "", fTo: "", chat: [], askDraft: "", asking: false, deckMode: "single", deckTitle: "\u5C08\u5229\u6280\u8853\u529F\u6548\u5206\u6790", deckQ: "", deckPage: 0, models: [], busy: "" }
   };
   const STEPS = [["import", "\u532F\u5165\u5C08\u5229"], ["taxonomy", "\u5206\u985E\u5B9A\u7FA9"], ["analyze", "AI \u6458\u8981\u8207\u5206\u985E"], ["matrix", "\u6280\u8853\u529F\u6548\u77E9\u9663"], ["ask", "\u554F\u7B54\u6AA2\u7D22"], ["slides", "\u532F\u51FA\u7C21\u5831"]];
@@ -2222,7 +2345,7 @@ ${q}`,
   <p class="lead">\u6280\u8853\u662F\u77E9\u9663\u7684\u5217\uFF0C\u529F\u6548\u662F\u77E9\u9663\u7684\u6B04\u3002AI \u6703\u4F9D\u9019\u88E1\u7684\u5B9A\u7FA9\u9010\u4EF6\u5224\u5B9A 1 \u6216 0\uFF0C\u5B9A\u7FA9\u5BEB\u5F97\u8D8A\u5177\u9AD4\uFF0C\u7D50\u679C\u8D8A\u4E00\u81F4\u3002</p>
   <div class="ways">
     <div class="way"><h3>\u4E0A\u50B3\u4F60\u7684\u5B9A\u7FA9</h3><p class="small muted">Excel \u6216 CSV \u6703\u76F4\u63A5\u8B80\u5165\uFF1BPDF\u3001Word\u3001\u6587\u5B57\u6A94\u7531 AI \u64F7\u53D6\u3002</p><div class="row wrap"><label class="btn" for="defInput">\u4E0A\u50B3\u5B9A\u7FA9\u6A94</label><input id="defInput" class="vh" type="file" accept=".xlsx,.xls,.csv,.pdf,.docx,.txt,.md"><button class="btn" data-act="tpl">\u4E0B\u8F09 Excel \u7BC4\u672C</button></div></div>
-    <div class="way"><h3>\u8ACB AI \u4F9D\u5C08\u5229\u5EFA\u8B70</h3><p class="small muted">AI \u62BD\u6A23\u8B80 40 \u4EF6\u6458\u8981\u5F8C\u63D0\u6848\uFF0C\u4F60\u518D\u4FEE\u6539\u78BA\u8A8D\u3002</p><div class="row wrap"><input id="txHint" placeholder="\u5206\u6790\u91CD\u9EDE\uFF08\u53EF\u4E0D\u586B\uFF09\uFF0C\u4F8B\u5982\uFF1A\u6DB2\u51B7\u6563\u71B1" aria-label="\u5206\u6790\u91CD\u9EDE"><button class="btn" data-act="txPropose" ${S.ui.busy ? "disabled" : ""}>${S.ui.busy === "tx" ? "\u63D0\u6848\u4E2D\u2026" : "\u8ACB AI \u63D0\u6848"}</button></div></div>
+    <div class="way"><h3>\u8ACB AI \u4F9D\u5C08\u5229\u5EFA\u8B70</h3><p class="small muted">AI \u62BD\u6A23\u8B80\u90E8\u5206\u5C08\u5229\u6458\u8981\u5F8C\u63D0\u6848\uFF0C\u4F60\u518D\u4FEE\u6539\u78BA\u8A8D\u3002</p><div class="row wrap"><input id="txHint" placeholder="\u5206\u6790\u91CD\u9EDE\uFF08\u53EF\u4E0D\u586B\uFF09\uFF0C\u4F8B\u5982\uFF1A\u6DB2\u51B7\u6563\u71B1" aria-label="\u5206\u6790\u91CD\u9EDE"><button class="btn" data-act="txPropose" ${S.ui.busy ? "disabled" : ""}>${S.ui.busy === "tx" ? "\u63D0\u6848\u4E2D\u2026" : "\u8ACB AI \u63D0\u6848"}</button></div></div>
   </div>
   <div class="txgrid">${col("tech", "\u6280\u8853", "\u4F8B\u5982\u51B7\u677F\u5F0F\u6DB2\u51B7\u3001\u6D78\u6C92\u5F0F\u6DB2\u51B7")}${col("eff", "\u529F\u6548", "\u4F8B\u5982\u63D0\u5347\u6563\u71B1\u6548\u7387\u3001\u63D0\u9AD8\u53EF\u9760\u5EA6")}</div>
   <div class="row end"><button class="btn primary" data-go="analyze" ${S.tx.tech.length && S.tx.eff.length ? "" : "disabled"}>\u4E0B\u4E00\u6B65\uFF1AAI \u6458\u8981\u8207\u5206\u985E</button></div>`;
@@ -2238,7 +2361,9 @@ ${q}`,
     const est = estimateTokens(todo);
     const pct = ready.length ? Math.round(done.length / ready.length * 100) : 0;
     const recent = [...ready].filter((p) => p.summary).slice(-8).reverse();
-    const provider = S.settings.provider === "gemini" ? "Gemini" : "Claude";
+    const provider = AI.label();
+    const isGroq = AI.provider() === "groq";
+    const mins = Math.ceil(Math.max(todo.length / Math.max(1, AI.rpm()), isGroq ? (est.input + est.output) / S.settings.groqTpm : 0));
     const groups = /* @__PURE__ */ new Map();
     errs.forEach((p) => {
       const k = p.aiError || "\u672A\u77E5\u932F\u8AA4";
@@ -2264,7 +2389,7 @@ ${q}`,
     <button class="btn primary" data-act="run" data-m="all" ${todo.length && !Job.running ? "" : "disabled"}>\u5168\u90E8\u958B\u59CB\uFF08${fmt(todo.length)} \u4EF6\uFF09</button>
     ${errs.length ? `<button class="btn" data-act="run" data-m="errors" ${Job.running ? "disabled" : ""}>\u91CD\u8DD1\u5931\u6557 ${fmt(errs.length)} \u4EF6</button>` : ""}
   </div>
-  <p class="small muted">\u5168\u90E8\u8DD1\u5B8C\u9810\u4F30\u7D04\u8F38\u5165 ${fmt(est.input)}\u3001\u8F38\u51FA ${fmt(est.output)} tokens\uFF08\u7C97\u4F30\uFF09\uFF1B\u6A21\u578B ${esc(AI.model())}\uFF0C\u540C\u6642 ${S.settings.concurrency} \u4EF6\u3001\u6BCF\u5206\u9418\u6700\u591A ${S.settings.rpm} \u6B21\uFF0C\u7D04\u9700 ${fmt(Math.ceil(todo.length / Math.max(1, S.settings.rpm)))} \u5206\u9418\u4EE5\u4E0A\u3002\u5EFA\u8B70\u5148\u8A66\u8DD1\uFF0C\u770B\u904E\u7D50\u679C\u518D\u5168\u8DD1\u3002\u57F7\u884C\u4E2D\u8ACB\u4FDD\u6301\u5206\u9801\u958B\u555F\uFF1B\u4E2D\u65B7\u5F8C\u518D\u6309\u4E00\u6B21\u6703\u5F9E\u672A\u5B8C\u6210\u7684\u7E7C\u7E8C\u3002</p>
+  <p class="small muted">\u5168\u90E8\u8DD1\u5B8C\u9810\u4F30\u7D04\u8F38\u5165 ${fmt(est.input)}\u3001\u8F38\u51FA ${fmt(est.output)} tokens\uFF08\u7C97\u4F30\uFF09\uFF1B\u6A21\u578B ${esc(AI.model())}\uFF0C\u540C\u6642 ${S.settings.concurrency} \u4EF6\u3001\u6BCF\u5206\u9418\u6700\u591A ${AI.rpm()} \u6B21${isGroq ? `\u3001${fmt(S.settings.groqTpm)} tokens` : ""}\uFF0C\u7D04\u9700 ${fmt(mins)} \u5206\u9418\u4EE5\u4E0A\u3002${isGroq ? "Groq \u7684\u6BCF\u65E5\u984D\u5EA6\u7528\u5B8C\u6642\u6703\u81EA\u52D5\u66AB\u505C\uFF0C\u5DF2\u5B8C\u6210\u7684\u7D50\u679C\u6703\u4FDD\u7559\u3002" : ""}\u5EFA\u8B70\u5148\u8A66\u8DD1\uFF0C\u770B\u904E\u7D50\u679C\u518D\u5168\u8DD1\u3002\u57F7\u884C\u4E2D\u8ACB\u4FDD\u6301\u5206\u9801\u958B\u555F\uFF1B\u4E2D\u65B7\u5F8C\u518D\u6309\u4E00\u6B21\u6703\u5F9E\u672A\u5B8C\u6210\u7684\u7E7C\u7E8C\u3002</p>
   ${groups.size ? `<h2>\u5931\u6557\u539F\u56E0</h2><ul class="recent errs">${[...groups.entries()].sort((a, b) => b[1] - a[1]).map(([m, n]) => `<li><span class="errtext">${esc(m)}</span><span class="pill bad">${fmt(n)} \u4EF6</span></li>`).join("")}</ul>` : ""}
   ${recent.length ? `<h2>\u6700\u8FD1\u5B8C\u6210</h2><ul class="recent">${recent.map((p) => `<li><button class="linkrow" data-act="open" data-id="${p.id}"><b>${esc(p.pubNo || p.title)}</b><span>${esc(p.summary.one_line)}</span></button>${statusPill(p)}</li>`).join("")}</ul>` : ""}
   ${done.length ? '<div class="row end"><button class="btn primary" data-go="matrix">\u67E5\u770B\u6280\u8853\u529F\u6548\u77E9\u9663</button></div>' : ""}`;
@@ -2399,22 +2524,26 @@ ${q}`,
   }
   function viewSettings() {
     const s = S.settings;
-    const g = s.provider === "gemini";
+    const pv = s.provider;
+    const g = pv === "gemini";
+    const gq = pv === "groq";
+    const radio = (v) => `<label class="${pv === v ? "on" : ""}"><input type="radio" name="provider" value="${v}" ${pv === v ? "checked" : ""}>${AI.label(v)}</label>`;
     return `<h1>AI \u8A2D\u5B9A</h1>
   <p class="lead">\u91D1\u9470\u53EA\u5B58\u5728\u9019\u500B\u700F\u89BD\u5668\uFF0C\u76F4\u63A5\u9023\u5230\u4F60\u9078\u7684 AI \u670D\u52D9\uFF0C\u4E0D\u7D93\u904E\u5176\u4ED6\u4F3A\u670D\u5668\u3002\u6309\u300C\u6E2C\u8A66\u91D1\u9470\u300D\u4E0D\u6703\u7522\u751F\u6A21\u578B\u8CBB\u7528\u3002</p>
-  <fieldset class="seg"><legend>\u4F7F\u7528\u54EA\u4E00\u5BB6 AI</legend>
-    <label class="${g ? "on" : ""}"><input type="radio" name="provider" value="gemini" ${g ? "checked" : ""}>Gemini</label>
-    <label class="${!g ? "on" : ""}"><input type="radio" name="provider" value="claude" ${!g ? "checked" : ""}>Claude</label>
-  </fieldset>
+  <fieldset class="seg"><legend>\u4F7F\u7528\u54EA\u4E00\u5BB6 AI</legend>${radio("gemini")}${radio("claude")}${radio("groq")}</fieldset>
   <div class="form2">
     <label class="field"><span>Gemini API \u91D1\u9470${g ? "" : "\uFF08\u9078\u586B\uFF0C\u50C5\u8A9E\u610F\u7D22\u5F15\u4F7F\u7528\uFF09"}</span><input id="kGemini" type="password" autocomplete="off" value="${esc(S.keys.gemini)}" placeholder="AIza\u2026"></label>
-    <label class="field"><span>Claude API \u91D1\u9470${!g ? "" : "\uFF08\u9078\u586B\uFF09"}</span><input id="kClaude" type="password" autocomplete="off" value="${esc(S.keys.claude)}" placeholder="sk-ant-\u2026"></label>
-    <label class="field"><span>${g ? "Gemini" : "Claude"} \u6A21\u578B</span><input id="model" list="modelList" value="${esc(g ? s.geminiModel : s.claudeModel)}"><datalist id="modelList">${S.ui.models.map((m) => `<option value="${esc(m)}">`).join("")}</datalist></label>
+    <label class="field"><span>Claude API \u91D1\u9470${pv === "claude" ? "" : "\uFF08\u9078\u586B\uFF09"}</span><input id="kClaude" type="password" autocomplete="off" value="${esc(S.keys.claude)}" placeholder="sk-ant-\u2026"></label>
+    <label class="field"><span>Groq API \u91D1\u9470${gq ? "" : "\uFF08\u9078\u586B\uFF09"}</span><input id="kGroq" type="password" autocomplete="off" value="${esc(S.keys.groq)}" placeholder="gsk_\u2026"></label>
+    <label class="field"><span>${AI.label()} \u6A21\u578B</span><input id="model" list="modelList" value="${esc(AI.model())}"><datalist id="modelList">${S.ui.models.map((m) => `<option value="${esc(m)}">`).join("")}</datalist></label>
     <div class="field"><span>\u78BA\u8A8D\u91D1\u9470\u53EF\u7528\u4E26\u8F09\u5165\u6A21\u578B\u6E05\u55AE</span><button class="btn" data-act="testKey" ${S.ui.busy ? "disabled" : ""}>${S.ui.busy === "test" ? "\u6E2C\u8A66\u4E2D\u2026" : "\u6E2C\u8A66\u91D1\u9470"}</button></div>
     <label class="field"><span>\u540C\u6642\u8655\u7406\u4EF6\u6578</span><input id="conc" type="number" min="1" max="20" value="${s.concurrency}"></label>
-    <label class="field"><span>\u6BCF\u5206\u9418\u6700\u591A\u8ACB\u6C42\u6578</span><input id="rpm" type="number" min="1" max="4000" value="${s.rpm}"></label>
+    <label class="field"><span>\u6BCF\u5206\u9418\u6700\u591A\u8ACB\u6C42\u6578</span><input id="rpm" type="number" min="1" max="4000" value="${AI.rpm()}"></label>
+    ${gq ? `<label class="field"><span>\u6BCF\u5206\u9418 token \u4E0A\u9650</span><input id="groqTpm" type="number" min="1000" max="10000000" value="${s.groqTpm}"></label>
+    <label class="field"><span>\u6BCF\u4EF6\u5C08\u5229\u9001\u7D66 AI \u7684\u5167\u5BB9</span><select id="contextMode"><option value="full" ${s.contextMode === "full" ? "selected" : ""}>\u5B8C\u6574\uFF1A\u6458\u8981\u3001\u8ACB\u6C42\u9805\u3001\u76F8\u95DC\u8AAA\u660E\u66F8\u6BB5\u843D</option><option value="lite" ${s.contextMode === "lite" ? "selected" : ""}>\u7CBE\u7C21\uFF1A\u53EA\u9001\u6458\u8981\u8207\u8ACB\u6C42\u9805\uFF0C\u8F03\u7701\u984D\u5EA6</option></select></label>` : ""}
   </div>
-  <p class="small muted">\u6BCF\u5206\u9418\u8ACB\u6C42\u6578\u8ACB\u4F9D\u4F60\u5E33\u865F\u7684\u984D\u5EA6\u8A2D\u5B9A\uFF1B\u9047\u5230\u5FD9\u788C\u56DE\u61C9\u6642\u6703\u81EA\u52D5\u7B49\u5F85\u4E26\u91CD\u8A66\u30022000 \u4EF6\u4EE5\u6BCF\u5206\u9418 60 \u6B21\u8A08\uFF0C\u7D04\u9700 35 \u5206\u9418\u3002</p>
+  ${gq ? '<div class="note"><b>Groq \u6CE8\u610F\u4E8B\u9805\uFF1A</b>\u984D\u5EA6\u901A\u5E38\u5361\u5728 token\uFF0C\u4E0D\u662F\u8ACB\u6C42\u6B21\u6578\uFF1B\u8ACB\u4F9D\u5E33\u865F\u5F8C\u53F0\u7684\u6578\u5B57\u586B\u5BEB\u4E0A\u65B9\u6B04\u4F4D\u3002\u7CBE\u7C21\u5167\u5BB9\u53EF\u80FD\u6F0F\u5224\u53EA\u5BEB\u5728\u8AAA\u660E\u66F8\u7684\u6280\u8853\u3002\u8A9E\u610F\u7D22\u5F15\u4ECD\u9700 Gemini \u91D1\u9470\uFF0C\u4E5F\u4E0D\u652F\u63F4\u6383\u63CF\u6A94\u8FA8\u8B58\u3002</div>' : ""}
+  ${gq ? "" : `<p class="small muted">\u6BCF\u5206\u9418\u8ACB\u6C42\u6578\u8ACB\u4F9D\u4F60\u5E33\u865F\u7684\u984D\u5EA6\u8A2D\u5B9A\uFF1B\u9047\u5230\u5FD9\u788C\u56DE\u61C9\u6642\u6703\u81EA\u52D5\u7B49\u5F85\u4E26\u91CD\u8A66\u30022000 \u4EF6\u4EE5\u6BCF\u5206\u9418 60 \u6B21\u8A08\uFF0C\u7D04\u9700 35 \u5206\u9418\u3002</p>`}
   <label class="check"><input type="checkbox" id="remember" ${s.rememberKeys ? "checked" : ""}> \u5728\u9019\u53F0\u96FB\u8166\u8A18\u4F4F\u91D1\u9470\uFF08\u5171\u7528\u96FB\u8166\u8ACB\u52FF\u52FE\u9078\uFF1B\u672A\u52FE\u9078\u6642\uFF0C\u91CD\u65B0\u6574\u7406\u5F8C\u8981\u518D\u8F38\u5165\uFF09</label>
   <h2>\u8CC7\u6599\u4FDD\u5B58</h2>
   <p class="small muted" id="quota">\u5C08\u5229\u8207\u7D50\u679C\u5B58\u5728\u9019\u500B\u700F\u89BD\u5668\u7684\u672C\u6A5F\u8CC7\u6599\u5EAB\uFF0C\u63DB\u96FB\u8166\u6216\u6E05\u9664\u700F\u89BD\u8CC7\u6599\u5C31\u6703\u6D88\u5931\u3002AI \u8DD1\u5B8C\u5F8C\u5EFA\u8B70\u4E0B\u8F09\u5099\u4EFD\u3002</p>
@@ -2501,7 +2630,7 @@ ${q}`,
     const done = currentClassified().length;
     const hasTx = S.tx.tech.length && S.tx.eff.length;
     const sub = { import: c.all ? `${fmt(c.all)} \u4EF6` : "\u5C1A\u672A\u532F\u5165", taxonomy: hasTx ? `${S.tx.tech.length} \u6280\u8853\u3001${S.tx.eff.length} \u529F\u6548` : "\u5C1A\u672A\u8A2D\u5B9A", analyze: c.ready ? `${fmt(S.patents.filter((p) => p.summary).length)} / ${fmt(c.ready)}` : "\u2014", matrix: done ? `${fmt(done)} \u4EF6` : "\u2014", ask: c.ready ? `${fmt(c.ready)} \u4EF6\u53EF\u67E5` : "\u2014", slides: `\u5DF2\u52FE\u9078 ${fmt(S.patents.filter((p) => p.selected).length)} \u4EF6` };
-    $("#rail").innerHTML = `<ol>${STEPS.map(([k, l], i) => `<li><button data-go="${k}" ${S.step === k ? 'aria-current="page"' : ""}><i>${i + 1}</i><span><b>${l}</b><small>${esc(sub[k])}</small></span></button></li>`).join("")}</ol><button class="railset" data-go="settings" ${S.step === "settings" ? 'aria-current="page"' : ""}><b>AI \u8A2D\u5B9A</b><small>${S.settings.provider === "gemini" ? "Gemini" : "Claude"}${AI.key() ? "" : "\uFF0C\u672A\u586B\u91D1\u9470"}</small></button>`;
+    $("#rail").innerHTML = `<ol>${STEPS.map(([k, l], i) => `<li><button data-go="${k}" ${S.step === k ? 'aria-current="page"' : ""}><i>${i + 1}</i><span><b>${l}</b><small>${esc(sub[k])}</small></span></button></li>`).join("")}</ol><button class="railset" data-go="settings" ${S.step === "settings" ? 'aria-current="page"' : ""}><b>AI \u8A2D\u5B9A</b><small>${AI.label()}${AI.key() ? "" : "\uFF0C\u672A\u586B\u91D1\u9470"}</small></button>`;
   }
   function render() {
     renderRail();
@@ -2835,9 +2964,28 @@ ${q}`,
         S.keys.claude = t.value;
         saveSettings();
       }
+      if (t.id === "kGroq") {
+        S.keys.groq = t.value;
+        AI.groqOk = false;
+        saveSettings();
+      }
       if (t.id === "model") {
-        if (S.settings.provider === "gemini") S.settings.geminiModel = t.value.trim();
-        else S.settings.claudeModel = t.value.trim();
+        const v = t.value.trim();
+        const st = S.settings;
+        if (st.provider === "gemini") st.geminiModel = v;
+        else if (st.provider === "groq") {
+          st.groqModel = v;
+          const known = { "llama-3.1-8b-instant": 6e3, "openai/gpt-oss-120b": 8e3, "llama-3.3-70b-versatile": 12e3 }[v];
+          if (known) {
+            st.groqTpm = known;
+            const el = $("#groqTpm");
+            if (el) el.value = known;
+          }
+        } else st.claudeModel = v;
+        saveSettings();
+      }
+      if (t.id === "groqTpm") {
+        S.settings.groqTpm = Math.max(1e3, +t.value || 1e3);
         saveSettings();
       }
       if (t.id === "conc") {
@@ -2845,7 +2993,9 @@ ${q}`,
         saveSettings();
       }
       if (t.id === "rpm") {
-        S.settings.rpm = Math.max(1, +t.value || 1);
+        const v = Math.max(1, +t.value || 1);
+        if (S.settings.provider === "groq") S.settings.groqRpm = v;
+        else S.settings.rpm = v;
         saveSettings();
       }
     });
@@ -2874,6 +3024,10 @@ ${q}`,
         S.ui.importFilter = t.value;
         S.ui.importPage = 0;
         render();
+      }
+      if (t.id === "contextMode") {
+        S.settings.contextMode = t.value;
+        saveSettings();
       }
       if (t.id === "remember") {
         S.settings.rememberKeys = t.checked;
@@ -3036,7 +3190,7 @@ ${q}`,
     render();
     updateDock();
   }
-  window.__app = { S, DB, Job, Importer, Limiter, computeMatrix, taxonomyHash, currentClassified, parsePatentText, retrieve, go, tokenize, BM25, verifyQuote };
+  window.__app = { S, AI, DB, Job, Importer, Limiter, computeMatrix, taxonomyHash, currentClassified, parsePatentText, retrieve, go, tokenize, BM25, verifyQuote };
   boot();
 })();
 </script>

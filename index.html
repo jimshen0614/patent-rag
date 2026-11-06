@@ -664,6 +664,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       return AI.provider() === "groq" && S.settings.contextMode === "lite";
     },
     groqOk: false,
+    noReasoningParam: false,
     async _fetch(url, init) {
       let r;
       try {
@@ -686,9 +687,13 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       }
       msg = clip(msg, 240);
       if (r.status === 413 || /request too large|context_length_exceeded|reduce the length|reduce your message/i.test(body)) throw new AIError(`\u9019\u4EF6\u5167\u5BB9\u8D85\u904E\u6A21\u578B\u6BCF\u6B21\u53EF\u8655\u7406\u7684\u4E0A\u9650\u3002\u5982\u679C\u4F7F\u7528 Groq\uFF0C\u53EF\u5230 AI \u8A2D\u5B9A\u6539\u7528\u300C\u7CBE\u7C21\u5167\u5BB9\u300D\u6216\u63DB\u8F03\u5927\u7684\u6A21\u578B\uFF1A${msg}`, "toolarge");
+      if (r.status === 400 && /reasoning_effort/.test(body)) {
+        AI.noReasoningParam = true;
+        throw new AIError("\u6A21\u578B\u4E0D\u652F\u63F4\u601D\u8003\u5F37\u5EA6\u8A2D\u5B9A\uFF0C\u6539\u7528\u9810\u8A2D\u91CD\u8A66", "content");
+      }
       if (r.status === 400 && /json_validate_failed/.test(body)) throw new AIError("AI \u56DE\u61C9\u4E0D\u662F\u6709\u6548\u7684 JSON", "content");
       if (r.status === 401 || r.status === 403) throw new AIError(`\u91D1\u9470\u88AB\u62D2\u7D55\uFF08${r.status}\uFF09\uFF1A${msg}`, "auth");
-      if (r.status === 404) throw new AIError(`\u627E\u4E0D\u5230\u6A21\u578B\uFF08404\uFF09\uFF0C\u8ACB\u5230\u8A2D\u5B9A\u6539\u7528\u53EF\u7528\u7684\u6A21\u578B\uFF1A${msg}`, "auth");
+      if (r.status === 404) throw new AIError(`\u627E\u4E0D\u5230\u6A21\u578B\uFF08404\uFF09\u3002\u8ACB\u5230\u300CAI \u8A2D\u5B9A\u300D\u6309\u300C\u6E2C\u8A66\u91D1\u9470\u300D\uFF0C\u518D\u5F9E\u6E05\u55AE\u9078\u4E00\u500B\u53EF\u7528\u7684\u6A21\u578B\uFF1A${msg}`, "auth");
       if (r.status === 400 && /api key|api_key|credential/i.test(msg)) throw new AIError(`\u91D1\u9470\u7121\u6548\uFF1A${msg}`, "auth");
       if (r.status === 429 || r.status === 529 || r.status >= 500) {
         const ra = parseFloat(r.headers.get("retry-after") || "");
@@ -736,6 +741,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
         const stamp = await Limiter.takeTokens(estTokens(system) + estTokens(user) + cap, S.settings.groqTpm);
         const body2 = { model: S.settings.groqModel, messages, temperature: 0.1, max_completion_tokens: cap };
         if (json) body2.response_format = { type: "json_object" };
+        if (/gpt-oss/.test(S.settings.groqModel) && !AI.noReasoningParam) body2.reasoning_effort = "low";
         let j2;
         try {
           j2 = await AI._fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -784,7 +790,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
         try {
           const out = await AI.callOnce(opts);
           if (Limiter.dyn) {
-            Limiter.dyn += 1;
+            Limiter.dyn = Math.ceil(Limiter.dyn * 1.05);
             if (Limiter.dyn >= AI.rpm()) Limiter.dyn = 0;
           }
           return out;
@@ -821,7 +827,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
       if (provider === "groq") {
         const j2 = await AI._fetch("https://api.groq.com/openai/v1/models", { headers: { authorization: `Bearer ${AI.key()}` } });
         AI.groqOk = true;
-        return (j2.data || []).map((m) => m.id).filter((id) => !/whisper|tts|guard|prompt-guard|orpheus/i.test(id)).sort();
+        return (j2.data || []).map((m) => m.id).filter((id) => !/whisper|tts|guard|orpheus|compound/i.test(id)).sort();
       }
       const j = await AI._fetch("https://api.anthropic.com/v1/models?limit=100", {
         headers: { "x-api-key": AI.key(), "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" }
@@ -2148,7 +2154,7 @@ ${q}`,
     index: null,
     vectors: /* @__PURE__ */ new Map(),
     keys: { gemini: "", claude: "", groq: "" },
-    settings: { provider: "gemini", geminiModel: "gemini-3.6-flash", claudeModel: "claude-haiku-5-5", groqModel: "llama-3.1-8b-instant", groqTpm: 6e3, groqRpm: 30, contextMode: "full", embedModel: "gemini-embedding-001", concurrency: 4, rpm: 60, keepFigures: true, rememberKeys: false },
+    settings: { provider: "gemini", geminiModel: "gemini-3.6-flash", claudeModel: "claude-haiku-5-5", groqModel: "openai/gpt-oss-120b", groqTpm: 8e3, groqTpd: 2e5, groqRpm: 30, contextMode: "full", embedModel: "gemini-embedding-001", concurrency: 4, rpm: 60, keepFigures: true, rememberKeys: false },
     ui: { importPage: 0, importQ: "", importFilter: "all", detailPage: 0, detailReview: false, detailQ: "", matrixTab: "matrix", sort: "def", fCountry: "", fApplicant: "", fFrom: "", fTo: "", chat: [], askDraft: "", asking: false, deckMode: "single", deckTitle: "\u5C08\u5229\u6280\u8853\u529F\u6548\u5206\u6790", deckQ: "", deckPage: 0, models: [], busy: "" }
   };
   const STEPS = [["import", "\u532F\u5165\u5C08\u5229"], ["taxonomy", "\u5206\u985E\u5B9A\u7FA9"], ["analyze", "AI \u6458\u8981\u8207\u5206\u985E"], ["matrix", "\u6280\u8853\u529F\u6548\u77E9\u9663"], ["ask", "\u554F\u7B54\u6AA2\u7D22"], ["slides", "\u532F\u51FA\u7C21\u5831"]];
@@ -2389,7 +2395,7 @@ ${q}`,
     <button class="btn primary" data-act="run" data-m="all" ${todo.length && !Job.running ? "" : "disabled"}>\u5168\u90E8\u958B\u59CB\uFF08${fmt(todo.length)} \u4EF6\uFF09</button>
     ${errs.length ? `<button class="btn" data-act="run" data-m="errors" ${Job.running ? "disabled" : ""}>\u91CD\u8DD1\u5931\u6557 ${fmt(errs.length)} \u4EF6</button>` : ""}
   </div>
-  <p class="small muted">\u5168\u90E8\u8DD1\u5B8C\u9810\u4F30\u7D04\u8F38\u5165 ${fmt(est.input)}\u3001\u8F38\u51FA ${fmt(est.output)} tokens\uFF08\u7C97\u4F30\uFF09\uFF1B\u6A21\u578B ${esc(AI.model())}\uFF0C\u540C\u6642 ${S.settings.concurrency} \u4EF6\u3001\u6BCF\u5206\u9418\u6700\u591A ${AI.rpm()} \u6B21${isGroq ? `\u3001${fmt(S.settings.groqTpm)} tokens` : ""}\uFF0C\u7D04\u9700 ${fmt(mins)} \u5206\u9418\u4EE5\u4E0A\u3002${isGroq ? "Groq \u7684\u6BCF\u65E5\u984D\u5EA6\u7528\u5B8C\u6642\u6703\u81EA\u52D5\u66AB\u505C\uFF0C\u5DF2\u5B8C\u6210\u7684\u7D50\u679C\u6703\u4FDD\u7559\u3002" : ""}\u5EFA\u8B70\u5148\u8A66\u8DD1\uFF0C\u770B\u904E\u7D50\u679C\u518D\u5168\u8DD1\u3002\u57F7\u884C\u4E2D\u8ACB\u4FDD\u6301\u5206\u9801\u958B\u555F\uFF1B\u4E2D\u65B7\u5F8C\u518D\u6309\u4E00\u6B21\u6703\u5F9E\u672A\u5B8C\u6210\u7684\u7E7C\u7E8C\u3002</p>
+  <p class="small muted">\u5168\u90E8\u8DD1\u5B8C\u9810\u4F30\u7D04\u8F38\u5165 ${fmt(est.input)}\u3001\u8F38\u51FA ${fmt(est.output)} tokens\uFF08\u7C97\u4F30\uFF09\uFF1B\u6A21\u578B ${esc(AI.model())}\uFF0C\u540C\u6642 ${S.settings.concurrency} \u4EF6\u3001\u6BCF\u5206\u9418\u6700\u591A ${AI.rpm()} \u6B21${isGroq ? `\u3001${fmt(S.settings.groqTpm)} tokens` : ""}\uFF0C\u7D04\u9700 ${fmt(mins)} \u5206\u9418\u4EE5\u4E0A\u3002${isGroq ? `\u4F9D\u6BCF\u65E5 ${fmt(S.settings.groqTpd)} tokens \u8A08\uFF0C\u7D04\u9700 ${fmt(Math.ceil((est.input + est.output) / S.settings.groqTpd))} \u5929\uFF1B\u6BCF\u65E5\u984D\u5EA6\u7528\u5B8C\u6642\u6703\u81EA\u52D5\u66AB\u505C\uFF0C\u5DF2\u5B8C\u6210\u7684\u7D50\u679C\u6703\u4FDD\u7559\uFF0C\u9694\u5929\u518D\u6309\u4E00\u6B21\u5373\u53EF\u63A5\u7E8C\u3002` : ""}\u5EFA\u8B70\u5148\u8A66\u8DD1\uFF0C\u770B\u904E\u7D50\u679C\u518D\u5168\u8DD1\u3002\u57F7\u884C\u4E2D\u8ACB\u4FDD\u6301\u5206\u9801\u958B\u555F\uFF1B\u4E2D\u65B7\u5F8C\u518D\u6309\u4E00\u6B21\u6703\u5F9E\u672A\u5B8C\u6210\u7684\u7E7C\u7E8C\u3002</p>
   ${groups.size ? `<h2>\u5931\u6557\u539F\u56E0</h2><ul class="recent errs">${[...groups.entries()].sort((a, b) => b[1] - a[1]).map(([m, n]) => `<li><span class="errtext">${esc(m)}</span><span class="pill bad">${fmt(n)} \u4EF6</span></li>`).join("")}</ul>` : ""}
   ${recent.length ? `<h2>\u6700\u8FD1\u5B8C\u6210</h2><ul class="recent">${recent.map((p) => `<li><button class="linkrow" data-act="open" data-id="${p.id}"><b>${esc(p.pubNo || p.title)}</b><span>${esc(p.summary.one_line)}</span></button>${statusPill(p)}</li>`).join("")}</ul>` : ""}
   ${done.length ? '<div class="row end"><button class="btn primary" data-go="matrix">\u67E5\u770B\u6280\u8853\u529F\u6548\u77E9\u9663</button></div>' : ""}`;
@@ -2535,11 +2541,12 @@ ${q}`,
     <label class="field"><span>Gemini API \u91D1\u9470${g ? "" : "\uFF08\u9078\u586B\uFF0C\u50C5\u8A9E\u610F\u7D22\u5F15\u4F7F\u7528\uFF09"}</span><input id="kGemini" type="password" autocomplete="off" value="${esc(S.keys.gemini)}" placeholder="AIza\u2026"></label>
     <label class="field"><span>Claude API \u91D1\u9470${pv === "claude" ? "" : "\uFF08\u9078\u586B\uFF09"}</span><input id="kClaude" type="password" autocomplete="off" value="${esc(S.keys.claude)}" placeholder="sk-ant-\u2026"></label>
     <label class="field"><span>Groq API \u91D1\u9470${gq ? "" : "\uFF08\u9078\u586B\uFF09"}</span><input id="kGroq" type="password" autocomplete="off" value="${esc(S.keys.groq)}" placeholder="gsk_\u2026"></label>
-    <label class="field"><span>${AI.label()} \u6A21\u578B</span><input id="model" list="modelList" value="${esc(AI.model())}"><datalist id="modelList">${S.ui.models.map((m) => `<option value="${esc(m)}">`).join("")}</datalist></label>
+    <label class="field"><span>${AI.label()} \u6A21\u578B</span>${S.ui.models.length ? `<select id="modelPick">${S.ui.models.includes(AI.model()) ? "" : `<option selected value="${esc(AI.model())}">${esc(AI.model())}\uFF08\u76EE\u524D\u5E33\u865F\u4E0D\u53EF\u7528\uFF09</option>`}${S.ui.models.map((m) => `<option value="${esc(m)}" ${m === AI.model() ? "selected" : ""}>${esc(m)}</option>`).join("")}</select>` : `<input id="model" value="${esc(AI.model())}">`}</label>
     <div class="field"><span>\u78BA\u8A8D\u91D1\u9470\u53EF\u7528\u4E26\u8F09\u5165\u6A21\u578B\u6E05\u55AE</span><button class="btn" data-act="testKey" ${S.ui.busy ? "disabled" : ""}>${S.ui.busy === "test" ? "\u6E2C\u8A66\u4E2D\u2026" : "\u6E2C\u8A66\u91D1\u9470"}</button></div>
     <label class="field"><span>\u540C\u6642\u8655\u7406\u4EF6\u6578</span><input id="conc" type="number" min="1" max="20" value="${s.concurrency}"></label>
     <label class="field"><span>\u6BCF\u5206\u9418\u6700\u591A\u8ACB\u6C42\u6578</span><input id="rpm" type="number" min="1" max="4000" value="${AI.rpm()}"></label>
     ${gq ? `<label class="field"><span>\u6BCF\u5206\u9418 token \u4E0A\u9650</span><input id="groqTpm" type="number" min="1000" max="10000000" value="${s.groqTpm}"></label>
+    <label class="field"><span>\u6BCF\u65E5 token \u4E0A\u9650\uFF08\u7528\u4F86\u4F30\u7B97\u5929\u6578\uFF09</span><input id="groqTpd" type="number" min="1000" value="${s.groqTpd}"></label>
     <label class="field"><span>\u6BCF\u4EF6\u5C08\u5229\u9001\u7D66 AI \u7684\u5167\u5BB9</span><select id="contextMode"><option value="full" ${s.contextMode === "full" ? "selected" : ""}>\u5B8C\u6574\uFF1A\u6458\u8981\u3001\u8ACB\u6C42\u9805\u3001\u76F8\u95DC\u8AAA\u660E\u66F8\u6BB5\u843D</option><option value="lite" ${s.contextMode === "lite" ? "selected" : ""}>\u7CBE\u7C21\uFF1A\u53EA\u9001\u6458\u8981\u8207\u8ACB\u6C42\u9805\uFF0C\u8F03\u7701\u984D\u5EA6</option></select></label>` : ""}
   </div>
   ${gq ? '<div class="note"><b>Groq \u6CE8\u610F\u4E8B\u9805\uFF1A</b>\u984D\u5EA6\u901A\u5E38\u5361\u5728 token\uFF0C\u4E0D\u662F\u8ACB\u6C42\u6B21\u6578\uFF1B\u8ACB\u4F9D\u5E33\u865F\u5F8C\u53F0\u7684\u6578\u5B57\u586B\u5BEB\u4E0A\u65B9\u6B04\u4F4D\u3002\u7CBE\u7C21\u5167\u5BB9\u53EF\u80FD\u6F0F\u5224\u53EA\u5BEB\u5728\u8AAA\u660E\u66F8\u7684\u6280\u8853\u3002\u8A9E\u610F\u7D22\u5F15\u4ECD\u9700 Gemini \u91D1\u9470\uFF0C\u4E5F\u4E0D\u652F\u63F4\u6383\u63CF\u6A94\u8FA8\u8B58\u3002</div>' : ""}
@@ -2871,7 +2878,8 @@ ${q}`,
       render();
       try {
         S.ui.models = await AI.listModels();
-        toast(`\u91D1\u9470\u53EF\u7528\uFF0C\u53D6\u5F97 ${S.ui.models.length} \u500B\u6A21\u578B\u3002`);
+        if (S.ui.models.includes(AI.model())) toast(`\u91D1\u9470\u53EF\u7528\uFF0C\u76EE\u524D\u7684\u6A21\u578B ${AI.model()} \u53EF\u4EE5\u4F7F\u7528\u3002`);
+        else toast(`\u91D1\u9470\u53EF\u7528\uFF0C\u4F46\u6A21\u578B ${AI.model()} \u4E0D\u5728\u4F60\u7684\u5E33\u865F\u6E05\u55AE\u4E2D\uFF0C\u8ACB\u5728\u300C\u6A21\u578B\u300D\u6B04\u6539\u9078\u4E00\u500B\u3002`, true);
       } catch (e) {
         toast(e.message, true);
       }
@@ -2975,13 +2983,11 @@ ${q}`,
         if (st.provider === "gemini") st.geminiModel = v;
         else if (st.provider === "groq") {
           st.groqModel = v;
-          const known = { "llama-3.1-8b-instant": 6e3, "openai/gpt-oss-120b": 8e3, "llama-3.3-70b-versatile": 12e3 }[v];
-          if (known) {
-            st.groqTpm = known;
-            const el = $("#groqTpm");
-            if (el) el.value = known;
-          }
         } else st.claudeModel = v;
+        saveSettings();
+      }
+      if (t.id === "groqTpd") {
+        S.settings.groqTpd = Math.max(1e3, +t.value || 1e3);
         saveSettings();
       }
       if (t.id === "groqTpm") {
@@ -3023,6 +3029,14 @@ ${q}`,
       if (t.id === "importFilter") {
         S.ui.importFilter = t.value;
         S.ui.importPage = 0;
+        render();
+      }
+      if (t.id === "modelPick") {
+        const st = S.settings;
+        if (st.provider === "gemini") st.geminiModel = t.value;
+        else if (st.provider === "groq") st.groqModel = t.value;
+        else st.claudeModel = t.value;
+        saveSettings();
         render();
       }
       if (t.id === "contextMode") {
@@ -3173,6 +3187,11 @@ ${q}`,
   }
   async function boot() {
     Object.assign(S.settings, LS.get("settings", {}));
+    if (/^llama-3\.[13]-/.test(S.settings.groqModel)) {
+      S.settings.groqModel = "openai/gpt-oss-120b";
+      S.settings.groqTpm = 8e3;
+      LS.set("settings", S.settings);
+    }
     if (S.settings.rememberKeys) Object.assign(S.keys, LS.get("keys", {}));
     try {
       await DB.open();
